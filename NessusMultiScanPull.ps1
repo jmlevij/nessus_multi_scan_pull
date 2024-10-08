@@ -1,6 +1,6 @@
 <#
 ScriptName: NessusMultiScanPull.ps1
-Purpose:    PowerShell script that uses REST methods to obtain and export Nessus scan reports in html, csv, and .nessus formats.
+Purpose:    PowerShell script that uses REST methods to obtain and export Nessus scan reports in html, csv, and .nessus formats, with an option to convert HTML to PDF.
 Created:    Updated in October 2024.
 Comments:   Portions of this script are derived from the works of Pwd9000-ML under the GPL license.
 Author:     James Levija
@@ -163,6 +163,32 @@ function Download-ScanExport {
     }
 }
 
+# Convert HTML to PDF using Microsoft Edge
+function Convert-HtmlToPdf {
+    param (
+        [string]$HtmlFilePath,
+        [string]$PdfFilePath
+    )
+    # Put the correct path for msedge.exe
+    Write-Host -Fore Cyan "[!] Converting HTML to PDF using Microsoft Edge..."
+    try {
+        $edgePath = "C:\Program Files (x86)\Microsoft\EdgeCore\129.0.2792.79\msedge.exe"
+        if (-not (Test-Path $edgePath)) {
+            Write-Host -Fore Red "[!] Microsoft Edge not found. Please ensure Edge is installed or update the path."
+            return
+        }
+        $arguments = "--headless --disable-gpu --print-to-pdf=$PdfFilePath $HtmlFilePath"
+        Start-Process -FilePath $edgePath -ArgumentList $arguments -NoNewWindow -Wait
+        if (Test-Path $PdfFilePath) {
+            Write-Host -Fore DarkCyan "[!] PDF conversion completed: $PdfFilePath"
+        } else {
+            Write-Host -Fore Red "[!] PDF conversion failed. PDF file not found."
+        }
+    } catch {
+        Write-Host -Fore Red "Error converting HTML to PDF: $($_.Exception.Message)"
+    }
+}
+
 # Logging Mechanism
 function Write-Log {
     param (
@@ -216,6 +242,12 @@ If ($answerexport -eq "Y") {
             $fileID = Export-Scan -ID $ID -Format $Format
             Check-ExportStatus -ID $ID -fileID $fileID
             Download-ScanExport -ID $ID -fileID $fileID -SaveFile $SaveFile
+
+            # Convert HTML to PDF if format is HTML
+            if ($Format -eq "html") {
+                $PdfFilePath = [System.IO.Path]::ChangeExtension($SaveFile, ".pdf")
+                Convert-HtmlToPdf -HtmlFilePath $SaveFile -PdfFilePath $PdfFilePath
+            }
         }
     } -ArgumentList $_, $Server, $ApiHeaders, $ReportPath
 } else {
