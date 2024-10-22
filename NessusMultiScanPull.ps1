@@ -2,7 +2,7 @@
 ScriptName: NessusMultiScanPull.ps1
 Purpose:    PowerShell script that uses REST methods to obtain and export Nessus scan reports in html, csv, and .nessus formats, with an option to convert HTML to PDF.
 Created:    Updated in October 2024.
-Comments:   Portions of this script are derived from the works of Pwd9000-ML under the GPL license.
+Comments:   Portions of this script are derived from the works of Pwd9000-ML under the GPL license. This script requires PowerShell 7 or later.
 Author:     James Levija
 GitHub:     https://github.com/jmlevij
 Attribution: Portions of this code are based on:
@@ -16,6 +16,9 @@ param (
   # Directory for storing reports
   [string]$ReportPath = ".\Nessus Reports"
 )
+
+# Disable SSL certificate validation to avoid trust issues
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 # Prompt user for Nessus API keys if not set in environment variables
 $AccessKey = [System.Environment]::GetEnvironmentVariable("NESSUS_ACCESS_KEY")
@@ -38,8 +41,6 @@ if (-not $secretKey) {
 }
 
 # Store API headers to avoid repeated calls
-$ApiHeaders = Get-ApiHeaders
-
 function Get-ApiHeaders {
     param (
       [string]$ContentType = "application/json"
@@ -54,13 +55,33 @@ function Get-ApiHeaders {
     return $headers
 }
 
+$ApiHeaders = Get-ApiHeaders
+
+# Logging Mechanism
+function Write-Log {
+    param (
+        [string]$Message
+    )
+    $LogFilePath = Join-Path -Path $ReportPath -ChildPath "NessusMultiScanPull.log"
+    Add-Content -Path $LogFilePath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') : $Message"
+}
+
+# Log the start of the script
+$UserName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$ScriptStartTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Write-Log "Script started by user: $UserName at $ScriptStartTime"
+
 # Retrieving the list of scans
 function Fetch-ScanDetails {
     Write-Host -Fore Cyan "[!] Fetching Scan Details..."
     $ScanURI = "$Server/scans"
     try {
-      $response = Invoke-WebRequest -Uri $ScanURI -SkipCertificateCheck -Method GET -Headers $ApiHeaders
-      return ConvertFrom-Json $response.Content | Select-Object -expand "scans"
+      $response = Invoke-WebRequest -Uri $ScanURI  -Method GET -Headers $ApiHeaders
+      if ($response.StatusCode -eq 200) {
+        return (ConvertFrom-Json $response.Content).scans
+      } else {
+        Write-Host -Fore Red "Error fetching scan details: Status Code $($response.StatusCode)"
+      }
     }
     catch {
       if ($_.Exception.Response.StatusCode -eq 401) {
@@ -68,8 +89,8 @@ function Fetch-ScanDetails {
       } else {
         Write-Host -Fore Red "Error fetching scan details: $($_.Exception.Message)"
       }
-      return $null
     }
+    return $null
 }
 
 # Displays the list of scans
@@ -109,15 +130,16 @@ function Export-Scan {
 }
 "@
     try {
-      $response = Invoke-WebRequest -Uri $ExportURI -SkipCertificateCheck -Method POST -Headers $ApiHeaders -ContentType 'application/json' -Body $ExportBody
-      if ($response.statuscode -eq '200') {
-        return ConvertFrom-Json $response.Content | Select-Object -expand "file"
+      $response = Invoke-WebRequest -Uri $ExportURI  -Method POST -Headers $ApiHeaders -ContentType 'application/json' -Body $ExportBody
+      if ($response.StatusCode -eq 200) {
+        return (ConvertFrom-Json $response.Content).file
       } else {
         Write-Host -Fore DarkCyan "[!] Export Not Successful. Status Code: $($response.StatusCode)"
       }
     } catch {
       Write-Host -Fore Red "Error exporting scan: $($_.Exception.Message)"
     }
+    return $null
 }
 
 # Check Export Status
@@ -127,11 +149,14 @@ function Check-ExportStatus {
       [string]$fileID
     )
     $StatusURI = "$Server/scans/$ID/export/$fileID/status"
-    while ($true) {
+    $maxRetries = 30  # Maximum number of retries
+    $retryCount = 0
+
+    while ($retryCount -lt $maxRetries) {
       try {
-        Write-Host -Fore Cyan "[!] Checking Export Status..."
-        $response = Invoke-WebRequest -Uri $StatusURI -SkipCertificateCheck -Method GET -Headers $ApiHeaders
-        if ($response.statuscode -eq '200') {
+        Write-Host -Fore Cyan "[!] Checking Export Status... (Attempt $($retryCount + 1) of $maxRetries)"
+        $response = Invoke-WebRequest -Uri $StatusURI  -Method GET -Headers $ApiHeaders
+        if ($response.StatusCode -eq 200) {
           $keyValueStatus = (ConvertFrom-Json $response.Content).status
           Write-Host -Fore DarkCyan "[*] Export Status is: $keyValueStatus"
           if ($keyValueStatus -eq 'ready') {
@@ -141,10 +166,14 @@ function Check-ExportStatus {
           }
         }
       } catch {
-        Write-Host "Error: $($_.Exception.Message). Retrying in 60 seconds..."
+        Write-Host "Error: $($_.Exception.Message). Retrying in 10 seconds..."
       }
-      Start-Sleep -Seconds 60
+      Start-Sleep -Seconds 10
+      $retryCount++
     }
+
+    Write-Host -Fore Red "[!] Maximum retries reached. Export did not complete."
+    Write-Log "Maximum retries reached while waiting for export to be ready."
 }
 
 function Download-ScanExport {
@@ -155,11 +184,12 @@ function Download-ScanExport {
     )
     Write-Host -Fore DarkCyan "[*] Starting Download!"
     $DownloadURI = "$Server/scans/$ID/export/$fileID/download"
-    Invoke-WebRequest -Uri $DownloadURI -Method GET -SkipCertificateCheck -Headers $ApiHeaders -OutFile $SaveFile
-    if (Test-Path $SaveFile) {
-      Write-Host -Fore DarkCyan "[!] Download Completed! File saved as: $SaveFile"
-    } else {
-      Write-Host -Fore Red "[!] Download Failed. File not found."
+    try {
+      Invoke-WebRequest -Uri $DownloadURI -Method GET -Headers $ApiHeaders -OutFile $SaveFile
+      Write-Host -Fore DarkCyan "[*] Download completed: $SaveFile"
+    } catch {
+      Write-Host -Fore Red "Error downloading scan export: $($_.Exception.Message)"
+      Write-Log "Error downloading scan export with ID $ID: $($_.Exception.Message)"
     }
 }
 
@@ -189,15 +219,6 @@ function Convert-HtmlToPdf {
     }
 }
 
-# Logging Mechanism
-function Write-Log {
-    param (
-        [string]$Message
-    )
-    $LogFilePath = Join-Path -Path $ReportPath -ChildPath "NessusMultiScanPull.log"
-    Add-Content -Path $LogFilePath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') : $Message"
-}
-
 # Main Logic
 $keyValueScan = Fetch-ScanDetails
 if (-not $keyValueScan) {
@@ -205,7 +226,7 @@ if (-not $keyValueScan) {
   Write-Log "Failed to fetch scan details."
   exit 1
 }
-$completedScans = $keyValueScan | Where-Object { $_.status -eq 'completed' }
+$completedScans = $keyValueScan | Where-Object { $_.status -eq 'completed' -and [System.DateTime]::UtcNow.AddDays(-1) -lt ([System.DateTime]'1970-01-01').AddSeconds($_.last_modification_date) }
 $notCompletedScans = $keyValueScan | Where-Object { $_.status -ne 'completed' }
 
 # Show the completed and not completed scans
@@ -225,32 +246,51 @@ do {
 } while ($answerexport -ne "Y" -and $answerexport -ne "N")
 
 If ($answerexport -eq "Y") {
-    $completedScans | ForEach-Object -Parallel {
-        param ($result, $Server, $ApiHeaders, $ReportPath)
-
-        $ScanName = $result.name
-        $ID = $result.id
+    $completedScans | ForEach-Object {
+        $ScanName = $_.name
+        $ID = $_.id
         $scanFolderPath = Join-Path -Path $ReportPath -ChildPath "$ScanName"
         if (-not (Test-Path $scanFolderPath)) {
             New-Item -ItemType Directory -Path $scanFolderPath | Out-Null
         }
 
         # Export and download for each format
+        $jobs = @()
         foreach ($Format in @("html", "csv", "nessus")) {
             $ExportFileName = "$ScanName`_$(Get-Date -format 'yyyyMMdd_HHmmss').$Format"
             $SaveFile = Join-Path -Path $scanFolderPath -ChildPath $ExportFileName
             $fileID = Export-Scan -ID $ID -Format $Format
-            Check-ExportStatus -ID $ID -fileID $fileID
-            Download-ScanExport -ID $ID -fileID $fileID -SaveFile $SaveFile
-
-            # Convert HTML to PDF if format is HTML
-            if ($Format -eq "html") {
-                $PdfFilePath = [System.IO.Path]::ChangeExtension($SaveFile, ".pdf")
-                Convert-HtmlToPdf -HtmlFilePath $SaveFile -PdfFilePath $PdfFilePath
+            if (-not $fileID) {
+                Write-Host -Fore Red "[!] Failed to export scan with ID $ID. Skipping to next format."
+                Write-Log "Failed to export scan with ID $ID for format $Format."
+                continue
             }
+            Check-ExportStatus -ID $ID -fileID $fileID
+            $jobs += Start-Job -ScriptBlock {
+                param($ID, $fileID, $SaveFile, $ApiHeaders, $Server)
+                $DownloadURI = "$Server/scans/$ID/export/$fileID/download"
+                Invoke-WebRequest -Uri $DownloadURI -Method GET -Headers $ApiHeaders -OutFile $SaveFile
+            } -ArgumentList $ID, $fileID, $SaveFile, $ApiHeaders, $Server
         }
-    } -ArgumentList $_, $Server, $ApiHeaders, $ReportPath
-} else {
+
+        # Wait for all download jobs to complete in batches
+        $batchSize = 5
+        while ($jobs.Count -gt 0) {
+            $currentBatch = $jobs[0..([math]::Min($batchSize, $jobs.Count) - 1)]
+            $currentBatch | ForEach-Object { $_ | Wait-Job }
+            $currentBatch | ForEach-Object { Receive-Job -Job $_ | Out-Null }
+            $jobs = $jobs[$batchSize..($jobs.Count - 1)]
+        }
+    }
+
+    # Convert all HTML files to PDF after downloads are complete
+    Get-ChildItem -Path $ReportPath -Recurse -Filter "*.html" | ForEach-Object {
+        $HtmlFilePath = $_.FullName
+        $PdfFilePath = [System.IO.Path]::ChangeExtension($HtmlFilePath, ".pdf")
+        Convert-HtmlToPdf -HtmlFilePath $HtmlFilePath -PdfFilePath $PdfFilePath
+    }
+}
+else {
     Write-Host "You selected not to export completed Scans. The script will now terminate."
     Write-Log "User chose not to export completed scans."
 }
